@@ -6,23 +6,9 @@
 #include <android/log.h>
 #include <unistd.h>
 
-// ============================================================
-//  CONFIG
-// ============================================================
 #define LOG_TAG   "libfps120"
 #define LOGFILE   "/storage/emulated/0/fps120_log.txt"
 #define EXPORT    __attribute__((visibility("default")))
-
-// Target FPS
-#define TARGET_FPS   120.0f
-
-// Offset dalam libGTASA.so (dari analisis binary)
-// OS_ThreadSleep — Thumb, bit-0 sudah dikurangi (alamat genap)
-#define OFF_OS_THREAD_SLEEP   0x26A8AC
-
-// 30.0f candidates di .data — pair FPS cap paling mungkin
-#define OFF_FPS_CAP_1         0x6AFC7C
-#define OFF_FPS_CAP_2         0x6AFC80
 
 // ============================================================
 //  LOGGING
@@ -32,53 +18,58 @@ static void _log(const char* msg) {
     FILE* f = fopen(LOGFILE, "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
-
 static void _logf(const char* fmt, ...) {
     char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
+    va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     _log(buf);
 }
 
 // ============================================================
+//  BACA BASE DARI /proc/self/maps (CARA BENAR ARM32)
+// ============================================================
+static uintptr_t get_lib_base(const char* libname) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[512];
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, libname) && strstr(line, "r-xp")) {
+            base = (uintptr_t)strtoul(line, nullptr, 16);
+            break;
+        }
+    }
+    fclose(f);
+    return base;
+}
+
+// ============================================================
 //  STATE
 // ============================================================
-static uintptr_t g_base         = 0;
-static int       g_hooked       = 0;
-static int       g_patched      = 0;
+static uintptr_t g_base_gtasa = 0;
+static uintptr_t g_base_samp  = 0;
 
 // ============================================================
-//  HOOK — OS_ThreadSleep
+//  HOOK — usleep
 // ============================================================
-static void (*orig_OS_ThreadSleep)(int ms) = nullptr;
+static int (*orig_usleep)(useconds_t us) = nullptr;
 
-static void hk_OS_ThreadSleep(int ms) {
-    // Skip frame-throttle sleep (>4ms) agar FPS tidak di-cap
-    // Sleep kecil (<=4ms) tetap dilewat untuk idle thread
-    if (ms > 4) return;
-    if (orig_OS_ThreadSleep) orig_OS_ThreadSleep(ms);
+static int hk_usleep(useconds_t us) {
+    // Skip frame-throttle sleep (>= 8ms = 125fps ceiling)
+    if (us >= 8000) return 0;
+    return orig_usleep ? orig_usleep(us) : 0;
 }
 
 // ============================================================
-//  HELPERS
+//  HOOK — nanosleep
 // ============================================================
-static void* _dobby_hook   = nullptr;
-static void* _dobby_sym    = nullptr;
+struct nano_timespec { long tv_sec; long tv_nsec; };
+static int (*orig_nanosleep)(const nano_timespec*, nano_timespec*) = nullptr;
 
-// Baca float dari offset relative ke base (debug)
-static float _read_float(uintptr_t offset) {
-    float val = 0.0f;
-    uintptr_t addr = g_base + offset;
-    memcpy(&val, (void*)addr, sizeof(float));
-    return val;
-}
-
-// Tulis float ke offset relative ke base
-static void _write_float(uintptr_t offset, float val) {
-    uintptr_t addr = g_base + offset;
-    memcpy((void*)addr, &val, sizeof(float));
+static int hk_nanosleep(const nano_timespec* req, nano_timespec* rem) {
+    if (req && (req->tv_sec > 0 || req->tv_nsec >= 8000000)) return 0;
+    return orig_nanosleep ? orig_nanosleep(req, rem) : 0;
 }
 
 // ============================================================
@@ -87,100 +78,99 @@ static void _write_float(uintptr_t offset, float val) {
 extern "C" {
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "fps120|1.0|Unlock 120 FPS via OS_ThreadSleep hook + FPS cap patch|brruham";
+    static const char* info = "fps120|2.0|Unlock 120 FPS via usleep+nanosleep hook|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
-    // Reset log
     remove(LOGFILE);
-    _log("[FPS120] ========== OnModPreLoad ==========");
-    _log("[FPS120] v1.0 | brruham-arch");
-    _log("[FPS120] Target: libGTASA.so ARM32 Thumb2");
+    _log("[FPS120] ========== OnModPreLoad v2.0 ==========");
+    _log("[FPS120] Strategy: hook usleep+nanosleep, base dari /proc/self/maps");
 }
 
 EXPORT void OnModLoad() {
-    _log("[FPS120] ========== OnModLoad ==========");
+    _log("[FPS120] ========== OnModLoad v2.0 ==========");
 
-    // --- 1. Dapatkan base libGTASA.so ---
-    void* hGTASA = dlopen("libGTASA.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!hGTASA) {
-        _log("[FPS120] ERROR: dlopen libGTASA.so gagal");
-        return;
+    // 1. Base address dari maps (bukan dlopen handle)
+    g_base_gtasa = get_lib_base("libGTASA.so");
+    g_base_samp  = get_lib_base("libsamp.so");
+    _logf("[FPS120] libGTASA.so base = 0x%08X", (unsigned)g_base_gtasa);
+    _logf("[FPS120] libsamp.so  base = 0x%08X", (unsigned)g_base_samp);
+
+    // 2. Verifikasi ELF magic di base
+    if (g_base_gtasa) {
+        uint8_t* m = (uint8_t*)g_base_gtasa;
+        _logf("[FPS120] ELF magic: %02X %02X %02X %02X", m[0],m[1],m[2],m[3]);
+
+        // Verifikasi OS_ThreadSleep bytes dengan base yang benar
+        uint8_t sb[4];
+        memcpy(sb, (void*)(g_base_gtasa + 0x26A8AC), 4);
+        _logf("[FPS120] OS_ThreadSleep@base+0x26A8AC: %02X %02X %02X %02X",
+              sb[0],sb[1],sb[2],sb[3]);
     }
-    g_base = (uintptr_t)hGTASA;
-    _logf("[FPS120] libGTASA.so base = 0x%08X", (unsigned)g_base);
 
-    // --- 2. Load Dobby ---
+    // 3. Load Dobby
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hDobby) {
-        _log("[FPS120] ERROR: dlopen libdobby.so gagal");
+    if (!hDobby) { _log("[FPS120] ERROR: libdobby tidak ada"); return; }
+    _log("[FPS120] libdobby OK");
+
+    auto dobbyHook     = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
+    auto dobbyResolver = (void*(*)(const char*,const char*))dlsym(hDobby, "DobbySymbolResolver");
+    if (!dobbyHook || !dobbyResolver) {
+        _log("[FPS120] ERROR: Dobby symbols tidak lengkap");
         return;
     }
-    _log("[FPS120] libdobby.so loaded OK");
 
-    auto dobbyHook = (int(*)(void*, void*, void**))dlsym(hDobby, "DobbyHook");
-    if (!dobbyHook) {
-        _log("[FPS120] ERROR: DobbyHook symbol tidak ditemukan");
-        return;
+    // 4. Hook usleep
+    void* usleep_addr = dobbyResolver("libGTASA.so", "usleep");
+    _logf("[FPS120] usleep via resolver = %p", usleep_addr);
+    if (!usleep_addr) {
+        usleep_addr = dlsym(RTLD_DEFAULT, "usleep");
+        _logf("[FPS120] usleep via dlsym   = %p", usleep_addr);
     }
-    _log("[FPS120] DobbyHook symbol OK");
-
-    // --- 3. Log nilai sebelum patch ---
-    float before1 = _read_float(OFF_FPS_CAP_1);
-    float before2 = _read_float(OFF_FPS_CAP_2);
-    _logf("[FPS120] BEFORE patch: [0x%X]=%.2f [0x%X]=%.2f",
-          OFF_FPS_CAP_1, before1,
-          OFF_FPS_CAP_2, before2);
-
-    // --- 4. Patch FPS cap floats di .data ---
-    _write_float(OFF_FPS_CAP_1, TARGET_FPS);
-    _write_float(OFF_FPS_CAP_2, TARGET_FPS);
-    g_patched = 1;
-
-    float after1 = _read_float(OFF_FPS_CAP_1);
-    float after2 = _read_float(OFF_FPS_CAP_2);
-    _logf("[FPS120] AFTER  patch: [0x%X]=%.2f [0x%X]=%.2f",
-          OFF_FPS_CAP_1, after1,
-          OFF_FPS_CAP_2, after2);
-
-    if (after1 == TARGET_FPS && after2 == TARGET_FPS) {
-        _log("[FPS120] FPS cap patch: BERHASIL");
-    } else {
-        _log("[FPS120] FPS cap patch: GAGAL (nilai tidak berubah — memory mungkin read-only)");
+    if (usleep_addr) {
+        int r = dobbyHook(usleep_addr, (void*)hk_usleep, (void**)&orig_usleep);
+        _logf("[FPS120] usleep hook: %s ret=%d orig=%p",
+              r==0?"OK":"FAIL", r, (void*)orig_usleep);
     }
 
-    // --- 5. Hook OS_ThreadSleep (Thumb = offset + 1) ---
-    // OS_ThreadSleep ada di .text, terpanggil tiap frame untuk throttle
-    uintptr_t sleepAddr = g_base + OFF_OS_THREAD_SLEEP + 1; // +1 = Thumb mode
-    _logf("[FPS120] OS_ThreadSleep target addr = 0x%08X", (unsigned)sleepAddr);
-
-    // Baca 4 byte pertama untuk verifikasi (Thumb BL)
-    uint8_t bytes[4];
-    memcpy(bytes, (void*)(sleepAddr - 1), 4);
-    _logf("[FPS120] OS_ThreadSleep bytes: %02X %02X %02X %02X",
-          bytes[0], bytes[1], bytes[2], bytes[3]);
-
-    int ret = dobbyHook((void*)sleepAddr,
-                        (void*)hk_OS_ThreadSleep,
-                        (void**)&orig_OS_ThreadSleep);
-    if (ret == 0) {
-        g_hooked = 1;
-        _logf("[FPS120] OS_ThreadSleep hook: BERHASIL (orig=%p)", (void*)orig_OS_ThreadSleep);
-    } else {
-        _logf("[FPS120] OS_ThreadSleep hook: GAGAL (ret=%d)", ret);
+    // 5. Hook nanosleep
+    void* nano_addr = dobbyResolver("libGTASA.so", "nanosleep");
+    _logf("[FPS120] nanosleep via resolver = %p", nano_addr);
+    if (!nano_addr) {
+        nano_addr = dlsym(RTLD_DEFAULT, "nanosleep");
+        _logf("[FPS120] nanosleep via dlsym   = %p", nano_addr);
+    }
+    if (nano_addr) {
+        int r = dobbyHook(nano_addr, (void*)hk_nanosleep, (void**)&orig_nanosleep);
+        _logf("[FPS120] nanosleep hook: %s ret=%d orig=%p",
+              r==0?"OK":"FAIL", r, (void*)orig_nanosleep);
     }
 
-    // --- 6. Ringkasan ---
+    // 6. Dump maps relevan
+    {
+        FILE* fm = fopen("/proc/self/maps", "r");
+        FILE* fo = fopen("/storage/emulated/0/fps120_maps.txt", "w");
+        if (fm && fo) {
+            char line[512];
+            while (fgets(line, sizeof(line), fm)) {
+                if (strstr(line,"libGTASA")||strstr(line,"libsamp")||
+                    strstr(line,"libdobby")||strstr(line,"libc.so"))
+                    fputs(line, fo);
+            }
+            fclose(fm); fclose(fo);
+            _log("[FPS120] maps -> /storage/emulated/0/fps120_maps.txt");
+        }
+    }
+
+    // 7. Ringkasan
     _log("[FPS120] ========== RINGKASAN ==========");
-    _logf("[FPS120] g_base    = 0x%08X", (unsigned)g_base);
-    _logf("[FPS120] patched   = %d", g_patched);
-    _logf("[FPS120] hooked    = %d", g_hooked);
-    _logf("[FPS120] target    = %.1f FPS", TARGET_FPS);
-    _log("[FPS120] ================================");
+    _logf("[FPS120] base_gtasa    = 0x%08X", (unsigned)g_base_gtasa);
+    _logf("[FPS120] usleep hooked = %d", orig_usleep   ? 1:0);
+    _logf("[FPS120] nano hooked   = %d", orig_nanosleep? 1:0);
+    _log("[FPS120] ==================================");
+    _log("[FPS120] Cek fps120_maps.txt untuk validasi base");
     _log("[FPS120] OnModLoad SELESAI");
-    _log("[FPS120] >> Jika physics/speed ikut kencang: CTimer::ms_fTimeStep");
-    _log("[FPS120] >> perlu diclamp. Lihat log lebih lanjut.");
 }
 
 } // extern "C"
