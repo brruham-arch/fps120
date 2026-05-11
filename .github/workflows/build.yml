@@ -1,0 +1,53 @@
+name: Build FPS120 AML Mod
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup NDK r25c
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: true
+
+      - name: Build libfps120.so
+        run: |
+          $ANDROID_NDK_ROOT/ndk-build \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=./jni/Android.mk \
+            NDK_APPLICATION_MK=./jni/Application.mk
+
+      - name: Verifikasi output
+        run: |
+          echo "=== File info ==="
+          ls -lh libs/armeabi-v7a/libfps120.so
+          file libs/armeabi-v7a/libfps120.so
+
+          echo "=== Exported symbols ==="
+          $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm \
+            -D libs/armeabi-v7a/libfps120.so | grep " [TD] "
+
+          echo "=== Undefined (dependencies) ==="
+          $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm \
+            -D libs/armeabi-v7a/libfps120.so | grep " U "
+
+          echo "=== ABI check ==="
+          $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf \
+            -h libs/armeabi-v7a/libfps120.so | grep "Machine\|Class"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libfps120-arm32
+          path: libs/armeabi-v7a/libfps120.so
+          retention-days: 7
