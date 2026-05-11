@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <android/log.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 #define LOG_TAG   "libfps120"
 #define LOGFILE   "/storage/emulated/0/fps120_log.txt"
